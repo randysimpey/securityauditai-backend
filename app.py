@@ -16,13 +16,12 @@ import logging
 import os
 import re
 import shutil
-import smtplib
 import subprocess
 import tempfile
 import time
-from email.mime.text import MIMEText
 from pathlib import Path
 
+import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
@@ -239,27 +238,24 @@ def build_report(repo_url: str, gitleaks_findings: list[dict], trivy_data: dict)
 
 
 def send_email(to_email: str, subject: str, body: str) -> None:
-    smtp_host = os.environ["SMTP_HOST"]
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ["SMTP_USER"]
-    smtp_pass = os.environ["SMTP_PASS"]
-    from_email = os.environ.get("FROM_EMAIL", smtp_user)
+    api_key = os.environ["RESEND_API_KEY"]
+    from_email = os.environ.get("FROM_EMAIL", "onboarding@resend.dev")
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = to_email
+    log.info("Resend API call to=%s", to_email)
 
-    log.info("SMTP connect host=%s port=%s", smtp_host, smtp_port)
-
-    if smtp_port == 465:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(from_email, [to_email], msg.as_string())
-    else:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(from_email, [to_email], msg.as_string())
-
-    log.info("SMTP connection closed cleanly")
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": from_email,
+            "to": [to_email],
+            "subject": subject,
+            "text": body,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    log.info("Resend accepted email id=%s", response.json().get("id"))
