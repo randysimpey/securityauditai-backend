@@ -1,0 +1,67 @@
+<!--
+  Drop this into your website (as its own page, or embedded in a section).
+  Change API_URL below to your deployed backend URL once it's live on Render/Railway.
+-->
+<div style="max-width:480px;margin:0 auto;font-family:system-ui,sans-serif;">
+  <h2 style="margin-bottom:4px;">Free Security Audit</h2>
+  <p style="color:#6272a4;margin-top:0;">
+    Paste a public GitHub repo. We'll scan for exposed secrets, vulnerable
+    dependencies, and IaC misconfigurations, then email you the report.
+  </p>
+
+  <form id="scan-form">
+    <input
+      type="url"
+      id="repo_url"
+      placeholder="https://github.com/owner/repo"
+      required
+      style="width:100%;padding:10px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px;"
+    />
+    <input
+      type="email"
+      id="email"
+      placeholder="you@example.com"
+      required
+      style="width:100%;padding:10px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px;"
+    />
+    <button
+      type="submit"
+      style="width:100%;padding:12px;background:#8be9fd;border:none;border-radius:6px;font-weight:600;cursor:pointer;"
+    >
+      Run Free Scan
+    </button>
+  </form>
+
+  <p id="scan-status" style="margin-top:12px;"></p>
+</div>
+
+<script>
+  // ⚠ Set this to your deployed backend URL, e.g. https://securityauditai.onrender.com
+  const API_URL = "https://YOUR-BACKEND-URL.onrender.com/scan";
+
+  document.getElementById("scan-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const status = document.getElementById("scan-status");
+    const repo_url = document.getElementById("repo_url").value;
+    const email = document.getElementById("email").value;
+
+    status.textContent = "Starting scan...";
+
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo_url, email }),
+      });
+      const data = await res.json();
+
+      if (res.ok) {
+        status.textContent = "✅ " + data.message;
+      } else {
+        status.textContent = "⚠ " + (data.detail || "Something went wrong.");
+      }
+    } catch (err) {
+      status.textContent = "⚠ Couldn't reach the scan service. Try again shortly.";
+    }
+  });
+</script>
