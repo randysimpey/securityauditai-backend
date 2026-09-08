@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -30,6 +31,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("securityauditai")
 
 app = FastAPI(title="SecurityAuditAI Scan Service")
+
+# In-memory job store — fine for MVP traffic on a single instance.
+# NOTE: this resets on redeploy/restart (Render free tier can spin down on
+# inactivity), so it's a live-progress cache, not a permanent record. The
+# email is the durable copy of every report.
+JOBS: dict[str, dict] = {}
+JOB_TTL_SECONDS = 3600
 
 # Allow your website/form to call this API directly from the browser.
 # Tighten this to your actual domain once it's live.
@@ -71,12 +79,33 @@ def health():
 
 @app.post("/scan")
 def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_scan_and_email, req.repo_url, req.email)
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {
+        "status": "queued",
+        "stage": "queued",
+        "repo_url": req.repo_url,
+        "created_at": time.time(),
+        "summary": None,
+        "error": None,
+    }
+    background_tasks.add_task(run_scan_and_email, req.repo_url, req.email, job_id)
     return {
         "status": "queued",
+        "job_id": job_id,
         "message": f"Scan started for {req.repo_url}. "
         f"Report will be emailed to {req.email} shortly.",
     }
+
+
+@app.get("/scan/{job_id}")
+def get_scan_status(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Unknown job_id — it may have expired after a server restart.",
+        )
+    return job
 
 
 @app.get("/scan-test")
@@ -84,36 +113,68 @@ def start_scan_get(repo_url: str, email: str, background_tasks: BackgroundTasks)
     """Convenience GET version so a scan can be triggered by opening a URL
     in a browser, without needing curl or a form. Same validation as /scan."""
     req = ScanRequest(repo_url=repo_url, email=email)
-    background_tasks.add_task(run_scan_and_email, req.repo_url, req.email)
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {
+        "status": "queued",
+        "stage": "queued",
+        "repo_url": req.repo_url,
+        "created_at": time.time(),
+        "summary": None,
+        "error": None,
+    }
+    background_tasks.add_task(run_scan_and_email, req.repo_url, req.email, job_id)
     return {
         "status": "queued",
+        "job_id": job_id,
         "message": f"Scan started for {req.repo_url}. "
         f"Report will be emailed to {req.email} shortly.",
     }
 
 
-def run_scan_and_email(repo_url: str, email: str) -> None:
+def run_scan_and_email(repo_url: str, email: str, job_id: str) -> None:
+    def update(stage: str, **extra):
+        if job_id in JOBS:
+            JOBS[job_id]["stage"] = stage
+            JOBS[job_id].update(extra)
+
     workdir = Path(tempfile.mkdtemp(prefix="saai_"))
     repo_dir = workdir / "repo"
-    log.info("SCAN START repo=%s email=%s workdir=%s", repo_url, email, workdir)
+    log.info("SCAN START repo=%s email=%s job=%s workdir=%s", repo_url, email, job_id, workdir)
     try:
+        update("cloning", status="running")
         clone_repo(repo_url, repo_dir)
         log.info("CLONE OK repo=%s", repo_url)
+
         check_repo_size(repo_dir)
         log.info("SIZE CHECK OK repo=%s", repo_url)
 
+        update("scanning_secrets")
         gitleaks_findings = run_gitleaks(repo_dir, workdir)
         log.info("GITLEAKS OK findings=%d", len(gitleaks_findings))
+
+        update("scanning_dependencies")
         trivy_findings = run_trivy(repo_dir, workdir)
         log.info("TRIVY OK")
+
+        vuln_count = sum(len(r.get("Vulnerabilities") or []) for r in trivy_findings.get("Results", []))
+        misconfig_count = sum(len(r.get("Misconfigurations") or []) for r in trivy_findings.get("Results", []))
+        summary = {
+            "secrets": len(gitleaks_findings),
+            "vulnerabilities": vuln_count,
+            "misconfigurations": misconfig_count,
+        }
+        update("emailing", summary=summary)
 
         report_text = build_report(repo_url, gitleaks_findings, trivy_findings)
         log.info("SENDING EMAIL to=%s", email)
         send_email(email, f"Your security audit for {repo_url}", report_text)
         log.info("EMAIL SENT to=%s", email)
 
+        update("done", status="done")
+
     except Exception as exc:  # noqa: BLE001 — MVP: report failures by email too
         log.exception("SCAN FAILED repo=%s error=%s", repo_url, exc)
+        update("failed", status="failed", error=str(exc)[:300])
         try:
             send_email(
                 email,
