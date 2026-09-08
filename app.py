@@ -270,5 +270,7 @@ def send_email(to_email: str, subject: str, body: str) -> None:
         },
         timeout=20,
     )
+    if not response.ok:
+        log.error("Resend error status=%s body=%s", response.status_code, response.text)
     response.raise_for_status()
     log.info("Resend accepted email id=%s", response.json().get("id"))
