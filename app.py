@@ -72,6 +72,65 @@ class ScanRequest(BaseModel):
         return v.rstrip("/")
 
 
+class SubscribeRequest(BaseModel):
+    email: EmailStr
+
+
+_AUDIENCE_ID_CACHE: str | None = None
+AUDIENCE_NAME = "CipherCapital Subscribers"
+
+
+def get_or_create_audience() -> str:
+    """Reuse the Resend Audience if it already exists, else create it once.
+    Cached in-process so we don't hit the API on every signup."""
+    global _AUDIENCE_ID_CACHE
+    if _AUDIENCE_ID_CACHE:
+        return _AUDIENCE_ID_CACHE
+
+    api_key = os.environ["RESEND_API_KEY"]
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    resp = requests.get("https://api.resend.com/audiences", headers=headers, timeout=15)
+    resp.raise_for_status()
+    for aud in resp.json().get("data", []):
+        if aud.get("name") == AUDIENCE_NAME:
+            _AUDIENCE_ID_CACHE = aud["id"]
+            log.info("Reusing existing Resend audience id=%s", aud["id"])
+            return _AUDIENCE_ID_CACHE
+
+    create_resp = requests.post(
+        "https://api.resend.com/audiences",
+        headers=headers,
+        json={"name": AUDIENCE_NAME},
+        timeout=15,
+    )
+    create_resp.raise_for_status()
+    _AUDIENCE_ID_CACHE = create_resp.json()["id"]
+    log.info("Created new Resend audience id=%s", _AUDIENCE_ID_CACHE)
+    return _AUDIENCE_ID_CACHE
+
+
+@app.post("/subscribe")
+def subscribe(req: SubscribeRequest):
+    api_key = os.environ["RESEND_API_KEY"]
+    try:
+        audience_id = get_or_create_audience()
+        resp = requests.post(
+            f"https://api.resend.com/audiences/{audience_id}/contacts",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"email": req.email, "unsubscribed": False},
+            timeout=15,
+        )
+        if resp.status_code == 409 or (resp.status_code == 400 and "already exists" in resp.text.lower()):
+            return {"status": "already_subscribed", "message": "You're already on the list."}
+        resp.raise_for_status()
+        log.info("SUBSCRIBED email=%s", req.email)
+        return {"status": "subscribed", "message": "You're on the list."}
+    except requests.HTTPError as exc:
+        log.error("Subscribe failed email=%s status=%s body=%s", req.email, exc.response.status_code, exc.response.text)
+        raise HTTPException(status_code=502, detail="Could not subscribe right now — try again shortly.")
+
+
 @app.get("/")
 def health():
     return {"status": "ok", "service": "SecurityAuditAI scan backend"}
