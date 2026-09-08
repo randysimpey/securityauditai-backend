@@ -12,6 +12,7 @@ endpoint, not a static repo — different tool/threat model, see README).
 """
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -25,6 +26,9 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("securityauditai")
 
 app = FastAPI(title="SecurityAuditAI Scan Service")
 
@@ -79,24 +83,35 @@ def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
 def run_scan_and_email(repo_url: str, email: str) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="saai_"))
     repo_dir = workdir / "repo"
+    log.info("SCAN START repo=%s email=%s workdir=%s", repo_url, email, workdir)
     try:
         clone_repo(repo_url, repo_dir)
+        log.info("CLONE OK repo=%s", repo_url)
         check_repo_size(repo_dir)
+        log.info("SIZE CHECK OK repo=%s", repo_url)
 
         gitleaks_findings = run_gitleaks(repo_dir, workdir)
+        log.info("GITLEAKS OK findings=%d", len(gitleaks_findings))
         trivy_findings = run_trivy(repo_dir, workdir)
+        log.info("TRIVY OK")
 
         report_text = build_report(repo_url, gitleaks_findings, trivy_findings)
+        log.info("SENDING EMAIL to=%s", email)
         send_email(email, f"Your security audit for {repo_url}", report_text)
+        log.info("EMAIL SENT to=%s", email)
 
     except Exception as exc:  # noqa: BLE001 — MVP: report failures by email too
-        send_email(
-            email,
-            f"Security audit failed for {repo_url}",
-            f"We couldn't complete the scan.\n\nReason: {exc}\n\n"
-            f"If this repo is large or private, that's likely why — "
-            f"reply to this email and we'll take a look.",
-        )
+        log.exception("SCAN FAILED repo=%s error=%s", repo_url, exc)
+        try:
+            send_email(
+                email,
+                f"Security audit failed for {repo_url}",
+                f"We couldn't complete the scan.\n\nReason: {exc}\n\n"
+                f"If this repo is large or private, that's likely why — "
+                f"reply to this email and we'll take a look.",
+            )
+        except Exception:
+            log.exception("FAILURE EMAIL ALSO FAILED for=%s", email)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -125,7 +140,7 @@ def run_gitleaks(repo_dir: Path, workdir: Path) -> list[dict]:
     report_path = workdir / "gitleaks.json"
     subprocess.run(
         [
-            "gitleaks", "detect",
+            "./gitleaks", "detect",
             "--source", str(repo_dir),
             "--report-format", "json",
             "--report-path", str(report_path),
@@ -145,7 +160,7 @@ def run_trivy(repo_dir: Path, workdir: Path) -> dict:
     report_path = workdir / "trivy.json"
     subprocess.run(
         [
-            "trivy", "fs",
+            "./trivy", "fs",
             "--scanners", "vuln,misconfig",
             "--format", "json",
             "--output", str(report_path),
