@@ -79,6 +79,19 @@ def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     }
 
 
+@app.get("/scan-test")
+def start_scan_get(repo_url: str, email: str, background_tasks: BackgroundTasks):
+    """Convenience GET version so a scan can be triggered by opening a URL
+    in a browser, without needing curl or a form. Same validation as /scan."""
+    req = ScanRequest(repo_url=repo_url, email=email)
+    background_tasks.add_task(run_scan_and_email, req.repo_url, req.email)
+    return {
+        "status": "queued",
+        "message": f"Scan started for {req.repo_url}. "
+        f"Report will be emailed to {req.email} shortly.",
+    }
+
+
 def run_scan_and_email(repo_url: str, email: str) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="saai_"))
     repo_dir = workdir / "repo"
