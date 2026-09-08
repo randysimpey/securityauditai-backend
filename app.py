@@ -250,7 +250,16 @@ def send_email(to_email: str, subject: str, body: str) -> None:
     msg["From"] = from_email
     msg["To"] = to_email
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(from_email, [to_email], msg.as_string())
+    log.info("SMTP connect host=%s port=%s", smtp_host, smtp_port)
+
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(from_email, [to_email], msg.as_string())
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(from_email, [to_email], msg.as_string())
+
+    log.info("SMTP connection closed cleanly")
