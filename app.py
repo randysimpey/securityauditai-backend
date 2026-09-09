@@ -97,8 +97,12 @@ def unmark_pro(email: str) -> None:
 
 # Maps a Stripe Payment Link ID to the tier it grants.
 PAYMENT_LINK_TIERS = {
+    # Test mode (Cipher Capital sandbox account)
     "plink_1UDX0uFyLwFaAD3Q772TkRmD": "pro",
     "plink_1UDizpFyLwFaAD3QVbYdvcn5": "business",
+    # Live mode (Cipher Capital account)
+    "plink_1UDjRqCQ26ATxEcCYbhNkZLn": "pro",
+    "plink_1UDjRvCQ26ATxEcCkSsyv0gi": "business",
 }
 
 PRO_REPO_LIMIT = 5
@@ -349,12 +353,19 @@ def get_scan_status(job_id: str):
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
-    webhook_secret = os.environ["STRIPE_WEBHOOK_SECRET"]
 
-    verify_stripe_signature(payload, sig_header, webhook_secret)
+    # Try both the test-mode and live-mode webhook secrets — whichever
+    # matches this payload's signature is the correct one.
+    possible_secrets = [
+        s for s in [
+            os.environ.get("STRIPE_WEBHOOK_SECRET"),
+            os.environ.get("STRIPE_WEBHOOK_SECRET_LIVE"),
+        ] if s
+    ]
+    verify_stripe_signature(payload, sig_header, possible_secrets)
     event = json.loads(payload)
     event_type = event.get("type")
-    log.info("STRIPE WEBHOOK received type=%s id=%s", event_type, event.get("id"))
+    log.info("STRIPE WEBHOOK received type=%s id=%s livemode=%s", event_type, event.get("id"), event.get("livemode"))
 
     if event_type == "checkout.session.completed":
         session = event["data"]["object"]
@@ -379,7 +390,7 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 
-def verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> None:
+def verify_stripe_signature(payload: bytes, sig_header: str, secrets: list[str]) -> None:
     try:
         parts = dict(p.split("=", 1) for p in sig_header.split(","))
         timestamp, signature = parts["t"], parts["v1"]
@@ -387,9 +398,11 @@ def verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> Non
         raise HTTPException(status_code=400, detail="Malformed Stripe-Signature header")
 
     signed_payload = f"{timestamp}.".encode() + payload
-    expected = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature):
-        raise HTTPException(status_code=400, detail="Invalid Stripe webhook signature")
+    for secret in secrets:
+        expected = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return
+    raise HTTPException(status_code=400, detail="Invalid Stripe webhook signature")
 
 
 @app.get("/scan-test")
