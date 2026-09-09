@@ -74,19 +74,59 @@ def redis_cmd(*args):
 
 
 def is_pro(email: str) -> bool:
+    """True for both Pro and Business — used for uncapped scanning."""
+    return get_tier(email) in ("pro", "business")
+
+
+def get_tier(email: str) -> str:
     try:
-        return redis_cmd("GET", f"pro:{email.lower()}") == "1"
+        tier = redis_cmd("GET", f"tier:{email.lower()}")
+        return tier if tier in ("pro", "business") else "free"
     except Exception:
-        log.exception("Redis GET failed — failing open (treat as not-pro, but don't block the request)")
-        return False
+        log.exception("Redis GET failed — failing open (treat as free tier)")
+        return "free"
 
 
-def mark_pro(email: str) -> None:
-    redis_cmd("SET", f"pro:{email.lower()}", "1")
+def set_tier(email: str, tier: str) -> None:
+    redis_cmd("SET", f"tier:{email.lower()}", tier)
 
 
 def unmark_pro(email: str) -> None:
-    redis_cmd("DEL", f"pro:{email.lower()}")
+    redis_cmd("DEL", f"tier:{email.lower()}")
+
+
+# Maps a Stripe Payment Link ID to the tier it grants.
+PAYMENT_LINK_TIERS = {
+    "plink_1UDX0uFyLwFaAD3Q772TkRmD": "pro",
+    "plink_1UDizpFyLwFaAD3QVbYdvcn5": "business",
+}
+
+PRO_REPO_LIMIT = 5
+
+
+def check_repo_limit(email: str, repo_url: str) -> None:
+    """Pro is capped at 5 distinct repos (ever). Business is unlimited.
+    Free tier never reaches this — it's blocked earlier by check_free_tier_limit."""
+    if get_tier(email) == "business":
+        return
+    key = f"pro_repos:{email.lower()}"
+    try:
+        existing = redis_cmd("SMEMBERS", key) or []
+        if repo_url in existing:
+            return  # already-scanned repo, doesn't count against the cap
+        if len(existing) >= PRO_REPO_LIMIT:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Pro is limited to {PRO_REPO_LIMIT} repos. "
+                    f"Upgrade to Business for unlimited repos."
+                ),
+            )
+        redis_cmd("SADD", key, repo_url)
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("Redis repo-limit check failed — failing open")
 
 
 def check_free_tier_limit(email: str) -> None:
@@ -197,7 +237,9 @@ def health():
 
 @app.post("/scan")
 def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
-    if not is_pro(req.email):
+    if is_pro(req.email):
+        check_repo_limit(req.email, req.repo_url)
+    else:
         check_free_tier_limit(req.email)
 
     job_id = uuid.uuid4().hex[:12]
@@ -244,17 +286,19 @@ async def stripe_webhook(request: Request):
         session = event["data"]["object"]
         email = session.get("customer_details", {}).get("email")
         customer_id = session.get("customer")
+        payment_link = session.get("payment_link")
+        tier = PAYMENT_LINK_TIERS.get(payment_link, "pro")  # default to pro if unrecognized
         if email:
-            mark_pro(email)
+            set_tier(email, tier)
             if customer_id:
                 redis_cmd("SET", f"customer_email:{customer_id}", email)
-            log.info("PRO ACTIVATED email=%s", email)
+            log.info("TIER ACTIVATED email=%s tier=%s", email, tier)
     elif event_type == "customer.subscription.deleted":
         customer_id = event["data"]["object"].get("customer")
         email = redis_cmd("GET", f"customer_email:{customer_id}") if customer_id else None
         if email:
             unmark_pro(email)
-            log.info("PRO DEACTIVATED email=%s", email)
+            log.info("TIER DEACTIVATED email=%s", email)
         else:
             log.warning("Could not find email for cancelled customer=%s", customer_id)
 
@@ -280,7 +324,9 @@ def start_scan_get(repo_url: str, email: str, background_tasks: BackgroundTasks)
     in a browser, without needing curl or a form. Same validation as /scan."""
     req = ScanRequest(repo_url=repo_url, email=email)
 
-    if not is_pro(req.email):
+    if is_pro(req.email):
+        check_repo_limit(req.email, req.repo_url)
+    else:
         check_free_tier_limit(req.email)
 
     job_id = uuid.uuid4().hex[:12]
@@ -335,9 +381,25 @@ def run_scan_and_email(repo_url: str, email: str, job_id: str) -> None:
         }
         update("emailing", summary=summary)
 
-        report_text = build_report(repo_url, gitleaks_findings, trivy_findings)
-        log.info("SENDING EMAIL to=%s", email)
-        send_email(email, f"Your security audit for {repo_url}", report_text)
+        tier = get_tier(email)
+        if tier in ("pro", "business"):
+            pdf_bytes = build_pdf_report(repo_url, gitleaks_findings, trivy_findings, tier)
+            repo_slug = repo_url.rstrip("/").split("/")[-1]
+            log.info("SENDING EMAIL (PDF, tier=%s) to=%s", tier, email)
+            send_email(
+                email,
+                f"Your SecurityAuditAI {tier.capitalize()} report for {repo_url}",
+                f"Your security audit for {repo_url} is attached as a PDF, "
+                f"including fix suggestions for every finding.\n\n"
+                f"Summary: {summary['secrets']} secrets, {summary['vulnerabilities']} "
+                f"vulnerabilities, {summary['misconfigurations']} IaC issues.",
+                pdf_attachment=pdf_bytes,
+                pdf_filename=f"securityauditai-{repo_slug}.pdf",
+            )
+        else:
+            report_text = build_report(repo_url, gitleaks_findings, trivy_findings)
+            log.info("SENDING EMAIL (text, tier=free) to=%s", email)
+            send_email(email, f"Your security audit for {repo_url}", report_text)
         log.info("EMAIL SENT to=%s", email)
 
         update("done", status="done")
@@ -419,7 +481,65 @@ def run_trivy(repo_dir: Path, workdir: Path) -> dict:
     return {}
 
 
+SECRET_REMEDIATION = {
+    "generic-api-key": "Revoke this key immediately, then move it to an environment variable or secret manager (never commit it, even to a private repo).",
+    "aws-access-token": "Rotate this AWS key immediately in the IAM console — treat it as compromised. Use environment variables or AWS Secrets Manager going forward.",
+    "private-key": "Revoke and regenerate this key pair. Private keys should never be committed; use a secrets manager or your CI/CD platform's encrypted secrets store.",
+    "github-pat": "Revoke this token at github.com/settings/tokens immediately, then use environment variables or GitHub Actions secrets instead.",
+    "slack-webhook-url": "Regenerate this webhook URL in Slack's app settings, then store it as an environment variable.",
+}
+DEFAULT_SECRET_REMEDIATION = (
+    "Treat this credential as compromised: revoke/rotate it, then move it to an "
+    "environment variable or a secrets manager instead of committing it to the repo."
+)
+
+
+def collect_findings(gitleaks_findings: list[dict], trivy_data: dict) -> dict:
+    """Turns raw Gitleaks/Trivy output into a structured, remediation-annotated
+    shape used by both the plain-text (free) and PDF (Pro/Business) reports."""
+    secrets = []
+    for f in gitleaks_findings:
+        rule = f.get("RuleID", "unknown")
+        secrets.append({
+            "rule": rule,
+            "file": f.get("File", "?"),
+            "line": f.get("StartLine", "?"),
+            "remediation": SECRET_REMEDIATION.get(rule, DEFAULT_SECRET_REMEDIATION),
+        })
+
+    vulnerabilities = []
+    for result in trivy_data.get("Results", []):
+        for v in result.get("Vulnerabilities") or []:
+            fixed = v.get("FixedVersion")
+            remediation = (
+                f"Upgrade {v.get('PkgName', 'this package')} to version {fixed} or later."
+                if fixed else
+                f"No fixed version published yet for {v.get('VulnerabilityID', 'this CVE')} — "
+                f"monitor the advisory and consider a temporary mitigation or alternative package."
+            )
+            vulnerabilities.append({
+                "severity": v.get("Severity", "?"),
+                "package": v.get("PkgName", "?"),
+                "installed": v.get("InstalledVersion", "?"),
+                "id": v.get("VulnerabilityID", "?"),
+                "remediation": remediation,
+            })
+
+    misconfigs = []
+    for result in trivy_data.get("Results", []):
+        for m in result.get("Misconfigurations") or []:
+            misconfigs.append({
+                "severity": m.get("Severity", "?"),
+                "title": m.get("Title", "?"),
+                "id": m.get("ID", "?"),
+                "remediation": m.get("Resolution") or "See the linked Trivy check ID for detailed guidance.",
+            })
+
+    return {"secrets": secrets, "vulnerabilities": vulnerabilities, "misconfigs": misconfigs}
+
+
 def build_report(repo_url: str, gitleaks_findings: list[dict], trivy_data: dict) -> str:
+    findings = collect_findings(gitleaks_findings, trivy_data)
     lines = [
         f"SecurityAuditAI — Free Scan Report",
         f"Repository: {repo_url}",
@@ -429,44 +549,30 @@ def build_report(repo_url: str, gitleaks_findings: list[dict], trivy_data: dict)
         "-" * 30,
     ]
 
-    if gitleaks_findings:
-        lines.append(f"⚠ {len(gitleaks_findings)} potential secret(s) found:")
-        for f in gitleaks_findings[:15]:
-            lines.append(
-                f"  - [{f.get('RuleID', 'unknown')}] {f.get('File', '?')}"
-                f" (line {f.get('StartLine', '?')})"
-            )
-        if len(gitleaks_findings) > 15:
-            lines.append(f"  ...and {len(gitleaks_findings) - 15} more.")
+    if findings["secrets"]:
+        lines.append(f"⚠ {len(findings['secrets'])} potential secret(s) found:")
+        for s in findings["secrets"][:15]:
+            lines.append(f"  - [{s['rule']}] {s['file']} (line {s['line']})")
+        if len(findings["secrets"]) > 15:
+            lines.append(f"  ...and {len(findings['secrets']) - 15} more.")
     else:
         lines.append("✅ No hardcoded secrets detected.")
 
     lines += ["", "2. DEPENDENCY VULNERABILITIES (SCA)", "-" * 30]
-    vuln_count = 0
-    for result in trivy_data.get("Results", []):
-        vulns = result.get("Vulnerabilities") or []
-        vuln_count += len(vulns)
-        for v in vulns[:10]:
-            lines.append(
-                f"  - [{v.get('Severity', '?')}] {v.get('PkgName', '?')} "
-                f"{v.get('InstalledVersion', '?')} — {v.get('VulnerabilityID', '?')}"
-            )
-    if vuln_count == 0:
-        lines.append("✅ No known dependency vulnerabilities detected.")
+    if findings["vulnerabilities"]:
+        for v in findings["vulnerabilities"][:10]:
+            lines.append(f"  - [{v['severity']}] {v['package']} {v['installed']} — {v['id']}")
+        lines.append(f"⚠ {len(findings['vulnerabilities'])} known vulnerabilities found across dependencies.")
     else:
-        lines.append(f"⚠ {vuln_count} known vulnerabilities found across dependencies.")
+        lines.append("✅ No known dependency vulnerabilities detected.")
 
     lines += ["", "3. INFRASTRUCTURE AS CODE (IaC)", "-" * 30]
-    misconfig_count = 0
-    for result in trivy_data.get("Results", []):
-        misconfigs = result.get("Misconfigurations") or []
-        misconfig_count += len(misconfigs)
-        for m in misconfigs[:10]:
-            lines.append(f"  - [{m.get('Severity', '?')}] {m.get('Title', '?')}")
-    if misconfig_count == 0:
-        lines.append("✅ No IaC misconfigurations detected.")
+    if findings["misconfigs"]:
+        for m in findings["misconfigs"][:10]:
+            lines.append(f"  - [{m['severity']}] {m['title']}")
+        lines.append(f"⚠ {len(findings['misconfigs'])} misconfiguration(s) found.")
     else:
-        lines.append(f"⚠ {misconfig_count} misconfiguration(s) found.")
+        lines.append("✅ No IaC misconfigurations detected.")
 
     lines += [
         "",
@@ -481,11 +587,100 @@ def build_report(repo_url: str, gitleaks_findings: list[dict], trivy_data: dict)
     return "\n".join(lines)
 
 
-def send_email(to_email: str, subject: str, body: str) -> None:
+def build_pdf_report(repo_url: str, gitleaks_findings: list[dict], trivy_data: dict, tier: str) -> bytes:
+    """Pro/Business report: same findings as the free text report, but with
+    remediation snippets for every item, and (Business only) a compliance
+    framing section suitable as SOC 2 / GDPR evidence."""
+    import io
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
+
+    findings = collect_findings(gitleaks_findings, trivy_data)
+
+    DARK = HexColor("#282a36")
+    PURPLE = HexColor("#7c3aed")
+    GREEN = HexColor("#16a34a")
+    RED = HexColor("#dc2626")
+    MUTED = HexColor("#6b7280")
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("T", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=22, textColor=DARK, spaceAfter=4)
+    subtitle_style = ParagraphStyle("S", parent=styles["Normal"], fontSize=11, textColor=MUTED, spaceAfter=18)
+    section_style = ParagraphStyle("H2", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=14, textColor=PURPLE, spaceBefore=16, spaceAfter=8)
+    body_style = ParagraphStyle("B", parent=styles["Normal"], fontSize=10, textColor=DARK, leading=14)
+    finding_style = ParagraphStyle("F", parent=styles["Normal"], fontSize=10, textColor=DARK, leading=14, leftIndent=10, spaceAfter=2)
+    remediation_style = ParagraphStyle("R", parent=styles["Normal"], fontSize=9.5, textColor=GREEN, leading=13, leftIndent=10, spaceAfter=10)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.75*inch, bottomMargin=0.75*inch, leftMargin=0.85*inch, rightMargin=0.85*inch)
+    story = []
+
+    report_label = "Compliance Evidence Report" if tier == "business" else "Security Audit Report"
+    story.append(Paragraph(f"SecurityAuditAI — {report_label}", title_style))
+    story.append(Paragraph(f"Repository: {repo_url} &nbsp;|&nbsp; Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", subtitle_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=HexColor("#e5e7eb"), spaceAfter=10))
+
+    if tier == "business":
+        story.append(Paragraph("Scope &amp; Methodology", section_style))
+        story.append(Paragraph(
+            "This report documents an automated static security scan of the repository above, "
+            "covering secrets detection (Gitleaks), dependency vulnerability analysis against "
+            "public CVE databases (Trivy), and infrastructure-as-code configuration review (Trivy). "
+            "Suitable as supporting evidence for SOC 2 and GDPR technical control reviews. "
+            "This is an automated static analysis, not a substitute for a full penetration test.",
+            body_style,
+        ))
+
+    def render_section(heading, color, items, render_item):
+        story.append(Paragraph(heading, ParagraphStyle("Hd", parent=section_style, textColor=color)))
+        if not items:
+            story.append(Paragraph("No issues found.", body_style))
+            return
+        for item in items:
+            render_item(item)
+
+    render_section("1. Secrets Detection", RED, findings["secrets"], lambda s: (
+        story.append(Paragraph(f"<b>[{s['rule']}]</b> {s['file']} (line {s['line']})", finding_style)),
+        story.append(Paragraph(f"→ Fix: {s['remediation']}", remediation_style)),
+    ))
+    render_section("2. Dependency Vulnerabilities", PURPLE, findings["vulnerabilities"], lambda v: (
+        story.append(Paragraph(f"<b>[{v['severity']}]</b> {v['package']} {v['installed']} — {v['id']}", finding_style)),
+        story.append(Paragraph(f"→ Fix: {v['remediation']}", remediation_style)),
+    ))
+    render_section("3. Infrastructure as Code", GREEN, findings["misconfigs"], lambda m: (
+        story.append(Paragraph(f"<b>[{m['severity']}]</b> {m['title']}", finding_style)),
+        story.append(Paragraph(f"→ Fix: {m['remediation']}", remediation_style)),
+    ))
+
+    story.append(Spacer(1, 10))
+    story.append(HRFlowable(width="100%", thickness=1, color=HexColor("#e5e7eb"), spaceAfter=8))
+    story.append(Paragraph("CipherCapital / SecurityAuditAI — automated security audits.", ParagraphStyle("F2", parent=styles["Normal"], fontSize=8.5, textColor=MUTED)))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def send_email(to_email: str, subject: str, body: str, pdf_attachment: bytes | None = None, pdf_filename: str = "report.pdf") -> None:
     api_key = os.environ["RESEND_API_KEY"]
     from_email = os.environ.get("FROM_EMAIL", "onboarding@resend.dev")
 
-    log.info("Resend API call to=%s", to_email)
+    log.info("Resend API call to=%s attachment=%s", to_email, bool(pdf_attachment))
+
+    payload = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "text": body,
+    }
+    if pdf_attachment:
+        import base64
+        payload["attachments"] = [{
+            "filename": pdf_filename,
+            "content": base64.b64encode(pdf_attachment).decode("ascii"),
+        }]
 
     response = requests.post(
         "https://api.resend.com/emails",
@@ -493,12 +688,7 @@ def send_email(to_email: str, subject: str, body: str) -> None:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json={
-            "from": from_email,
-            "to": [to_email],
-            "subject": subject,
-            "text": body,
-        },
+        json=payload,
         timeout=20,
     )
     if not response.ok:
