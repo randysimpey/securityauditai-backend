@@ -81,7 +81,17 @@ def is_pro(email: str) -> bool:
 def get_tier(email: str) -> str:
     try:
         tier = redis_cmd("GET", f"tier:{email.lower()}")
-        return tier if tier in ("pro", "business") else "free"
+        if tier in ("pro", "business"):
+            return tier
+        # Backward compatibility: early Pro grants were written under the
+        # old "pro:" key before the Pro/Business tier split. Self-heal by
+        # migrating them to the new key so this only has to happen once.
+        legacy = redis_cmd("GET", f"pro:{email.lower()}")
+        if legacy == "1":
+            redis_cmd("SET", f"tier:{email.lower()}", "pro")
+            log.info("MIGRATED legacy pro key for %s", email)
+            return "pro"
+        return "free"
     except Exception:
         log.exception("Redis GET failed — failing open (treat as free tier)")
         return "free"
