@@ -235,6 +235,80 @@ def health():
     return {"status": "ok", "service": "SecurityAuditAI scan backend"}
 
 
+class RegisterRepoRequest(BaseModel):
+    repo_url: str
+    email: EmailStr
+
+    @field_validator("repo_url")
+    @classmethod
+    def validate_github_url(cls, v: str) -> str:
+        v = v.strip()
+        if not GITHUB_URL_RE.match(v):
+            raise ValueError("repo_url must be a public GitHub URL, e.g. https://github.com/owner/repo")
+        return v.rstrip("/")
+
+
+@app.post("/business/register-repo")
+def register_repo(req: RegisterRepoRequest):
+    """Business tier only. Links a repo to a Business account so pushes to it
+    trigger an automatic scan. Returns a webhook secret the customer adds to
+    their GitHub repo's webhook settings."""
+    if get_tier(req.email) != "business":
+        raise HTTPException(
+            status_code=402,
+            detail="Auto-scan on commit is a Business-tier feature. Upgrade to enable it.",
+        )
+
+    secret = uuid.uuid4().hex + uuid.uuid4().hex  # 64 hex chars
+    redis_cmd("SET", f"business_repo:{req.repo_url}", json.dumps({"email": req.email, "secret": secret}))
+
+    owner_repo = req.repo_url.replace("https://github.com/", "")
+    webhook_url = f"https://securityauditai-backend.onrender.com/webhook/github/{owner_repo}"
+
+    return {
+        "status": "registered",
+        "webhook_url": webhook_url,
+        "webhook_secret": secret,
+        "instructions": (
+            f"In your GitHub repo → Settings → Webhooks → Add webhook. "
+            f"Payload URL: {webhook_url} — Content type: application/json — "
+            f"Secret: (the webhook_secret above) — Events: 'Just the push event'."
+        ),
+    }
+
+
+@app.post("/webhook/github/{owner}/{repo}")
+async def github_webhook(owner: str, repo: str, request: Request, background_tasks: BackgroundTasks):
+    repo_url = f"https://github.com/{owner}/{repo}"
+    raw = redis_cmd("GET", f"business_repo:{repo_url}")
+    if not raw:
+        raise HTTPException(status_code=404, detail="This repo is not registered for auto-scan.")
+    registration = json.loads(raw)
+
+    payload = await request.body()
+    sig_header = request.headers.get("x-hub-signature-256", "")
+    expected = "sha256=" + hmac.new(registration["secret"].encode(), payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig_header):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature.")
+
+    event_type = request.headers.get("x-github-event", "")
+    if event_type != "push":
+        return {"status": "ignored", "reason": f"event type '{event_type}' is not 'push'"}
+
+    email = registration["email"]
+    if get_tier(email) != "business":
+        return {"status": "ignored", "reason": "account is no longer Business tier"}
+
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {
+        "status": "queued", "stage": "queued", "repo_url": repo_url,
+        "created_at": time.time(), "summary": None, "error": None,
+    }
+    background_tasks.add_task(run_scan_and_email, repo_url, email, job_id)
+    log.info("GITHUB WEBHOOK triggered scan repo=%s email=%s job=%s", repo_url, email, job_id)
+    return {"status": "queued", "job_id": job_id}
+
+
 @app.post("/scan")
 def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     if is_pro(req.email):
