@@ -11,6 +11,8 @@ NOT included in this MVP: live API security scanning (requires a running
 endpoint, not a static repo — different tool/threat model, see README).
 """
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -20,10 +22,12 @@ import subprocess
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
 
@@ -39,6 +43,8 @@ app = FastAPI(title="SecurityAuditAI Scan Service")
 JOBS: dict[str, dict] = {}
 JOB_TTL_SECONDS = 3600
 
+FREE_SCANS_PER_MONTH = 1
+
 # Allow your website/form to call this API directly from the browser.
 # Tighten this to your actual domain once it's live.
 app.add_middleware(
@@ -50,10 +56,63 @@ app.add_middleware(
 
 GITHUB_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/?$")
 
-# Safety limits — MVP has no auth/payment gate, so keep scans cheap and bounded.
+# Safety limits — free tier is rate-limited (see check_free_tier_limit below);
+# Pro users (marked via Stripe webhook) bypass the monthly cap entirely.
 MAX_REPO_SIZE_MB = int(os.environ.get("MAX_REPO_SIZE_MB", "300"))
 CLONE_TIMEOUT_SEC = int(os.environ.get("CLONE_TIMEOUT_SEC", "120"))
 SCAN_TIMEOUT_SEC = int(os.environ.get("SCAN_TIMEOUT_SEC", "180"))
+
+
+# --- Upstash Redis (REST) — stores Pro status + free-tier monthly usage ---
+def redis_cmd(*args):
+    base = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
+    token = os.environ["UPSTASH_REDIS_REST_TOKEN"]
+    url = base + "/" + "/".join(quote(str(a), safe="") for a in args)
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    resp.raise_for_status()
+    return resp.json().get("result")
+
+
+def is_pro(email: str) -> bool:
+    try:
+        return redis_cmd("GET", f"pro:{email.lower()}") == "1"
+    except Exception:
+        log.exception("Redis GET failed — failing open (treat as not-pro, but don't block the request)")
+        return False
+
+
+def mark_pro(email: str) -> None:
+    redis_cmd("SET", f"pro:{email.lower()}", "1")
+
+
+def unmark_pro(email: str) -> None:
+    redis_cmd("DEL", f"pro:{email.lower()}")
+
+
+def check_free_tier_limit(email: str) -> None:
+    """Raises HTTPException if a non-Pro email has already used its free
+    scan(s) this calendar month. Silently allows the request through if
+    Redis itself is unreachable — a scan should never hard-fail because of
+    the rate limiter being down."""
+    month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+    key = f"freeuse:{email.lower()}:{month_key}"
+    try:
+        count = int(redis_cmd("INCR", key))
+        if count == 1:
+            redis_cmd("EXPIRE", key, 40 * 86400)
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("Redis INCR failed — failing open, allowing the scan")
+        return
+    if count > FREE_SCANS_PER_MONTH:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Free tier limit reached ({FREE_SCANS_PER_MONTH} scan/month). "
+                f"Upgrade to SecurityAuditAI Pro for unlimited scans."
+            ),
+        )
 
 
 class ScanRequest(BaseModel):
@@ -138,6 +197,9 @@ def health():
 
 @app.post("/scan")
 def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
+    if not is_pro(req.email):
+        check_free_tier_limit(req.email)
+
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {
         "status": "queued",
@@ -167,11 +229,60 @@ def get_scan_status(job_id: str):
     return job
 
 
+@app.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    webhook_secret = os.environ["STRIPE_WEBHOOK_SECRET"]
+
+    verify_stripe_signature(payload, sig_header, webhook_secret)
+    event = json.loads(payload)
+    event_type = event.get("type")
+    log.info("STRIPE WEBHOOK received type=%s id=%s", event_type, event.get("id"))
+
+    if event_type == "checkout.session.completed":
+        session = event["data"]["object"]
+        email = session.get("customer_details", {}).get("email")
+        customer_id = session.get("customer")
+        if email:
+            mark_pro(email)
+            if customer_id:
+                redis_cmd("SET", f"customer_email:{customer_id}", email)
+            log.info("PRO ACTIVATED email=%s", email)
+    elif event_type == "customer.subscription.deleted":
+        customer_id = event["data"]["object"].get("customer")
+        email = redis_cmd("GET", f"customer_email:{customer_id}") if customer_id else None
+        if email:
+            unmark_pro(email)
+            log.info("PRO DEACTIVATED email=%s", email)
+        else:
+            log.warning("Could not find email for cancelled customer=%s", customer_id)
+
+    return {"received": True}
+
+
+def verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> None:
+    try:
+        parts = dict(p.split("=", 1) for p in sig_header.split(","))
+        timestamp, signature = parts["t"], parts["v1"]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed Stripe-Signature header")
+
+    signed_payload = f"{timestamp}.".encode() + payload
+    expected = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=400, detail="Invalid Stripe webhook signature")
+
+
 @app.get("/scan-test")
 def start_scan_get(repo_url: str, email: str, background_tasks: BackgroundTasks):
     """Convenience GET version so a scan can be triggered by opening a URL
     in a browser, without needing curl or a form. Same validation as /scan."""
     req = ScanRequest(repo_url=repo_url, email=email)
+
+    if not is_pro(req.email):
+        check_free_tier_limit(req.email)
+
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {
         "status": "queued",
